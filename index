@@ -1,0 +1,221 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>10 pc 별 등급 실험</title>
+<style>
+/* 지구를 아래 가운데에 두고 10 pc 원을 그린 화면 전체 하늘. 별은 지구를 잇는 선을 따라 드래그 */
+:root { --sky: #070c24; --fg: #f2f4fd; --mark: #ffe14d; color-scheme: dark; }
+html, body { height: 100%; margin: 0; background: var(--sky); color: var(--fg); overflow: hidden; }
+canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: default; }
+button { position: absolute; right: max(16px, env(safe-area-inset-right, 0px)); bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  font: 600 15px "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", sans-serif; color: var(--fg); background: rgba(7,12,36,.7);
+  border: 1px solid #5a678f; border-radius: 6px; padding: 9px 14px; cursor: pointer; }
+button:focus-visible, input:focus-visible + canvas { outline: 2px solid var(--mark); outline-offset: 2px; }
+.sr { position: absolute; width: 1px; height: 1px; opacity: 0; overflow: hidden; }
+</style>
+
+<div id="inputs"></div>
+<canvas id="sky" role="img" aria-label="지구와 10 pc 원, 세 별의 밝기와 거리를 나타낸 밤하늘. 별을 끌어 거리를 바꿀 수 있다."></canvas>
+<button id="reset">처음으로</button>
+
+<script>
+var FONT = '"Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", sans-serif';
+var STARS = [
+  { name: '알타이르',     m: 0.77,  M: 2.2,  T: 7600,  ang: -42 },
+  { name: '아르크투루스', m: -0.04, M: -0.3, T: 4286,  ang: 4 },
+  { name: '리겔',         m: 0.12,  M: -6.8, T: 12100, ang: 50 }
+];
+var MIN_LOG = Math.log10(2), MAX_LOG = 3, EYE_LIMIT = 6.5, SNAP_PX = 12;
+var c = document.getElementById('sky'), g = c.getContext('2d');
+var W, H, dpr, ex, ey, ring, bg = [], dragging = null, tween = null, touched = false;
+
+// 흑체 복사 → sRGB (CIE 등색함수는 Wyman 외 2013 근사식)
+function lobe(x, a, m, s1, s2) { var t = (x - m) * (x < m ? s1 : s2); return a * Math.exp(-0.5 * t * t); }
+function starColor(T) {
+  var X = 0, Y = 0, Z = 0;
+  for (var l = 380; l <= 780; l += 5) {
+    var w = l * 1e-9, B = 1 / (Math.pow(w, 5) * (Math.exp(1.4388e-2 / (w * T)) - 1));
+    X += B * (lobe(l, 0.362, 442, 0.0624, 0.0374) + lobe(l, 1.056, 599.8, 0.0264, 0.0323) + lobe(l, -0.065, 501.1, 0.049, 0.0382));
+    Y += B * (lobe(l, 0.821, 568.8, 0.0213, 0.0247) + lobe(l, 0.286, 530.9, 0.0613, 0.0322));
+    Z += B * (lobe(l, 1.217, 437, 0.0845, 0.0278) + lobe(l, 0.681, 459, 0.0385, 0.0725));
+  }
+  var lin = [3.2406 * X - 1.5372 * Y - 0.4986 * Z, -0.9689 * X + 1.8758 * Y + 0.0415 * Z, 0.0557 * X - 0.204 * Y + 1.057 * Z];
+  var top = Math.max.apply(null, lin);
+  return lin.map(function (v) { v = Math.max(0, v / top); return Math.round(255 * (v <= 0.0031308 ? 12.92 * v : 1.055 * Math.pow(v, 1 / 2.4) - 0.055)); });
+}
+
+STARS.forEach(function (s, i) {
+  s.rgb = starColor(s.T).join(',');
+  s.home = (s.m - s.M + 5) / 5; s.logd = s.home;
+  s.ux = Math.sin(s.ang * Math.PI / 180); s.uy = -Math.cos(s.ang * Math.PI / 180);
+  var r = document.createElement('input');
+  r.type = 'range'; r.className = 'sr'; r.min = MIN_LOG * 1000; r.max = 3000; r.step = 10;
+  r.setAttribute('aria-label', s.name + '까지의 거리');
+  r.value = s.home * 1000; s.input = r;
+  r.addEventListener('input', function () { stop(); touched = true; s.logd = Math.abs(r.value / 1000 - 1) < 0.02 ? 1 : r.value / 1000; draw(); });
+  document.getElementById('inputs').appendChild(r);
+});
+
+function mag(s) { return s.M + 5 * (s.logd - 1); }
+function fmt(x, n) { return x.toFixed(n).replace('-', '−'); }
+
+// 10 pc 안쪽은 실제 비율, 바깥쪽은 물결 표시처럼 압축(로그)
+function toR(s, logd) { return logd <= 1 ? ring * Math.pow(10, logd - 1) : ring + (s.rMax - ring) * (logd - 1) / 2; }
+function toLog(s, r) {
+  if (r <= ring) return 1 + Math.log10(Math.max(r, 1) / ring);
+  return 1 + 2 * (r - ring) / (s.rMax - ring);
+}
+
+function layout() {
+  var rect = c.getBoundingClientRect();
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = rect.width; H = rect.height;
+  c.width = Math.round(W * dpr); c.height = Math.round(H * dpr);
+  ex = W / 2; ey = H - Math.max(58, H * 0.13);
+  ring = Math.min(W * 0.34, H * 0.42);
+  STARS.forEach(function (s) {
+    var a = s.ux ? (W / 2 - 34) / Math.abs(s.ux) : 1e9, b = (ey - 50) / -s.uy;
+    s.rMax = Math.max(Math.min(a, b), ring * 1.25);
+  });
+  var seed = 4242; function rnd() { seed = (seed * 16807) % 2147483647; return seed / 2147483647; }
+  bg = [];
+  var n = Math.round(W * H / 3200);
+  for (var i = 0; i < n; i++) bg.push([rnd() * W, rnd() * H, 0.1 + 0.6 * rnd() * rnd(), 0.4 + 0.8 * rnd()]);
+  draw();
+}
+
+function pos(s, logd) { var r = toR(s, logd); return [ex + s.ux * r, ey + s.uy * r]; }
+function arrow(x1, y1, x2, y2, color, w) {
+  var a = Math.atan2(y2 - y1, x2 - x1), h = w * 3;
+  g.strokeStyle = g.fillStyle = color; g.lineWidth = w;
+  g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2 - Math.cos(a) * h, y2 - Math.sin(a) * h); g.stroke();
+  g.beginPath(); g.moveTo(x2, y2);
+  g.lineTo(x2 - h * 1.5 * Math.cos(a - 0.5), y2 - h * 1.5 * Math.sin(a - 0.5));
+  g.lineTo(x2 - h * 1.5 * Math.cos(a + 0.5), y2 - h * 1.5 * Math.sin(a + 0.5)); g.closePath(); g.fill();
+}
+function text(str, x, y, font, color, align) {
+  g.font = font + ' ' + FONT; g.textAlign = align || 'center'; g.textBaseline = 'middle';
+  g.lineWidth = 4; g.lineJoin = 'round'; g.strokeStyle = 'rgba(5,8,24,.85)'; g.strokeText(str, x, y);
+  g.fillStyle = color; g.fillText(str, x, y);
+}
+
+function glowR(m) { return ring / 26 * Math.pow(10, -0.12 * m); }  // 화면 표현용: 빛 반경 ∝ 밝기^0.3
+
+function drawEarth() {
+  var R = Math.max(16, ring * 0.075), o = g.createRadialGradient(ex - R * .3, ey - R * .35, R * .1, ex, ey, R);
+  o.addColorStop(0, '#6fb7ee'); o.addColorStop(.7, '#2467b5'); o.addColorStop(1, '#123a78');
+  g.fillStyle = o; g.beginPath(); g.arc(ex, ey, R, 0, 7); g.fill();
+  g.save(); g.beginPath(); g.arc(ex, ey, R, 0, 7); g.clip();
+  g.fillStyle = '#4e9a5b';
+  [[-.35, -.3, .42, .3, .4], [.3, .25, .36, .46, -.5], [.45, -.5, .24, .18, .3]].forEach(function (b) {
+    g.beginPath(); g.ellipse(ex + b[0] * R, ey + b[1] * R, b[2] * R, b[3] * R, b[4], 0, 7); g.fill();
+  });
+  g.restore();
+  text('지구', ex, ey + R + 15, '600 14px', '#f2f4fd');
+}
+
+function draw() {
+  if (!W) return;
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.globalCompositeOperation = 'source-over';
+  g.fillStyle = '#070c24'; g.fillRect(0, 0, W, H);
+  bg.forEach(function (b) { g.fillStyle = 'rgba(214,224,255,' + b[2] + ')'; g.beginPath(); g.arc(b[0], b[1], b[3], 0, 7); g.fill(); });
+
+  // 10 pc 원
+  g.strokeStyle = '#ffe14d'; g.lineWidth = 2.5; g.beginPath(); g.arc(ex, ey, ring, 0, 7); g.stroke();
+  var endX = ex + ring;
+  g.strokeStyle = g.fillStyle = '#ffe14d'; g.lineWidth = 2.5;
+  g.beginPath(); g.moveTo(ex + Math.max(16, ring * .075) + 4, ey); g.lineTo(endX - 2, ey); g.stroke();
+  arrow(endX - 12, ey, endX - 1, ey, '#ffe14d', 2.5);
+  arrow(ex + Math.max(16, ring * .075) + 14, ey, ex + Math.max(16, ring * .075) + 3, ey, '#ffe14d', 2.5);
+  text('10 pc', ex + ring * .55, ey + 18, '700 17px', '#ffe14d');
+
+  STARS.forEach(function (s) {
+    var e = pos(s, MAX_LOG), p = pos(s, s.logd), h = pos(s, s.home);
+    g.strokeStyle = 'rgba(170,190,235,.32)'; g.lineWidth = 1.2; g.setLineDash([3, 6]);
+    g.beginPath(); g.moveTo(ex, ey); g.lineTo(e[0], e[1]); g.stroke(); g.setLineDash([]);
+    // 축척이 바뀌는 곳의 물결 표시
+    var bx = ex + s.ux * (ring + (s.rMax - ring) * .26), by = ey + s.uy * (ring + (s.rMax - ring) * .26);
+    g.save(); g.translate(bx, by); g.rotate(Math.atan2(s.uy, s.ux)); g.strokeStyle = '#dfe6ff'; g.lineWidth = 1.5;
+    [-3, 3].forEach(function (dx) { g.beginPath(); g.moveTo(dx - 3, -8); g.quadraticCurveTo(dx + 4, -3, dx, 0); g.quadraticCurveTo(dx - 4, 3, dx + 3, 8); g.stroke(); });
+    g.restore();
+    var dist = Math.hypot(p[0] - h[0], p[1] - h[1]);
+    if (dist > 26) {
+      g.fillStyle = 'rgba(' + s.rgb + ',.55)'; g.beginPath(); g.arc(h[0], h[1], 4, 0, 7); g.fill();
+      arrow(h[0], h[1], p[0] - (p[0] - h[0]) / dist * 8, p[1] - (p[1] - h[1]) / dist * 8, 'rgba(95,190,235,.75)', 4);
+    }
+  });
+
+  g.globalCompositeOperation = 'lighter';
+  STARS.forEach(function (s) {
+    var m = mag(s), p = pos(s, s.logd), R = glowR(m) * 2.4, alpha = Math.min(1, (EYE_LIMIT - m) / 3.5);
+    if (m > EYE_LIMIT) return;
+    var o = g.createRadialGradient(p[0], p[1], 0, p[0], p[1], R);
+    o.addColorStop(0, 'rgba(255,255,255,' + alpha + ')');
+    o.addColorStop(.1, 'rgba(255,255,255,' + alpha + ')');
+    o.addColorStop(.2, 'rgba(' + s.rgb + ',' + alpha + ')');
+    o.addColorStop(.42, 'rgba(' + s.rgb + ',' + .32 * alpha + ')');
+    o.addColorStop(1, 'rgba(' + s.rgb + ',0)');
+    g.fillStyle = o; g.beginPath(); g.arc(p[0], p[1], R, 0, 7); g.fill();
+  });
+  g.globalCompositeOperation = 'source-over';
+
+  drawEarth();
+
+  STARS.forEach(function (s) {
+    var m = mag(s), p = pos(s, s.logd), at10 = s.logd === 1, off = Math.max(46, glowR(m) * .9 + 34);
+    if (m > 3) { g.strokeStyle = 'rgba(220,228,255,.6)'; g.lineWidth = 1.2; g.beginPath(); g.arc(p[0], p[1], 9, 0, 7); g.stroke(); }
+    var lx = Math.min(W - 72, Math.max(72, p[0] + s.ux * off)), ly = Math.min(H - 40, Math.max(32, p[1] + s.uy * off));
+    var d = Math.pow(10, s.logd);
+    text(s.name, lx, ly - 21, '700 16px', '#ffffff');
+    text(at10 ? '절대 등급: ' + fmt(s.M, 1) : '겉보기 등급: ' + fmt(m, 2), lx, ly, '700 16px', at10 ? '#ffe14d' : '#ffffff');
+    text(m > EYE_LIMIT ? (d >= 100 ? Math.round(d) : d.toFixed(1)) + ' pc, 맨눈으로 안 보임' : (d >= 100 ? Math.round(d) : d.toFixed(1)) + ' pc', lx, ly + 20, '500 14px', '#cfd8f5');
+  });
+
+  if (!touched) text('별을 지구 쪽이나 바깥쪽으로 끌어 보세요', W / 2, 24, '600 15px', '#cfd8f5');
+}
+
+function pick(x, y) {
+  var best = null, bd = 44;
+  STARS.forEach(function (s) { var p = pos(s, s.logd), d = Math.hypot(x - p[0], y - p[1]); if (d < bd) { bd = d; best = s; } });
+  return best;
+}
+function xy(e) { var r = c.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; }
+function stop() { if (tween) { cancelAnimationFrame(tween); tween = null; } }
+
+c.addEventListener('pointerdown', function (e) {
+  var q = xy(e), s = pick(q[0], q[1]);
+  if (!s) return;
+  stop(); dragging = s; touched = true; c.setPointerCapture(e.pointerId); c.style.cursor = 'grabbing';
+  e.preventDefault();
+});
+c.addEventListener('pointermove', function (e) {
+  var q = xy(e);
+  if (!dragging) { c.style.cursor = pick(q[0], q[1]) ? 'grab' : 'default'; return; }
+  var s = dragging, r = (q[0] - ex) * s.ux + (q[1] - ey) * s.uy;
+  r = Math.min(s.rMax, Math.max(toR(s, MIN_LOG), r));
+  if (Math.abs(r - ring) <= SNAP_PX) s.logd = 1;
+  else if (Math.abs(r - toR(s, s.home)) <= 6) s.logd = s.home;
+  else s.logd = toLog(s, r);
+  s.input.value = s.logd * 1000;
+  draw();
+});
+function end() { dragging = null; c.style.cursor = 'default'; }
+c.addEventListener('pointerup', end);
+c.addEventListener('pointercancel', end);
+
+document.getElementById('reset').addEventListener('click', function () {
+  stop();
+  var from = STARS.map(function (s) { return s.logd; });
+  function finish() { STARS.forEach(function (s) { s.logd = s.home; s.input.value = s.home * 1000; }); draw(); }
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return finish();
+  var t0 = performance.now();
+  (function step(now) {
+    var p = Math.min(1, (now - t0) / 700), e = p * p * (3 - 2 * p);
+    if (p === 1) { tween = null; return finish(); }
+    STARS.forEach(function (s, i) { s.logd = from[i] + (s.home - from[i]) * e; });
+    draw(); tween = requestAnimationFrame(step);
+  })(t0);
+});
+window.addEventListener('resize', layout);
+layout();
+</script>
